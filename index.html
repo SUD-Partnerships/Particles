@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Interactive Particle Physics (Thumb + Mutual Interaction)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <style>
+    html, body {
+      margin: 0; padding: 0; height: 100%; overflow: hidden;
+      background: #0a0a0a; color: #eaeaea; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    #ui {
+      position: fixed; top: 12px; left: 12px; z-index: 10;
+      background: rgba(20,20,20,0.75); backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.08); border-radius: 10px;
+      padding: 10px 12px; display: grid; gap: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+    #ui .row { display: grid; gap: 6px; }
+    #ui label { font-size: 12px; opacity: 0.9; }
+    #ui input[type="range"] { width: 250px; }
+    #ui .inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #ui .pill {
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+      background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.06);
+    }
+    #ui .sep { height: 1px; background: rgba(255,255,255,0.08); margin: 2px 0 4px; }
+    #fps { font-variant-numeric: tabular-nums; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    a { color: #7dd3fc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="row">
+      <div class="inline">
+        <label for="count">Particles: <span id="countLabel" class="pill">20,000</span></label>
+      </div>
+      <input id="count" type="range" min="1" max="100000" step="1" value="20000" />
+    </div>
+    <div class="row inline">
+      <label for="touchForce">Thumb Force</label>
+      <input id="touchForce" type="range" min="0" max="2000" step="10" value="800" />
+      <span id="forceLabel" class="pill">800</span>
+    </div>
+    <div class="row inline">
+      <label for="mode">Thumb Mode</label>
+      <select id="mode">
+        <option value="attract">Attract</option>
+        <option value="repel">Repel</option>
+      </select>
+      <label for="size">Particle Size</label>
+      <input id="size" type="range" min="1" max="6" step="1" value="3" />
+      <span id="sizeLabel" class="pill">3 px</span>
+    </div>
+    <div class="row inline">
+      <label><input id="trails" type="checkbox" checked /> Trails</label>
+      <label><input id="adaptive" type="checkbox" checked /> Adaptive compute</label>
+      <span id="fps" class="pill">FPS: …</span>
+    </div>
+    <div class="sep"></div>
+    <small>Touch/hold with your thumb (or mouse) to interact.</small>
+  </div>
+  <canvas id="gl"></canvas>
+
+  <script>
+  (() => {
+    // --------- Utilities ----------
+    const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+    const rand = (a, b) => a + Math.random() * (b - a);
+    const dpr = () => Math.max(1, Math.min(2.5, window.devicePixelRatio || 1));
+
+    // --------- DOM refs ----------
+    const canvas = document.getElementById('gl');
+    const countSlider = document.getElementById('count');
+    const countLabel  = document.getElementById('countLabel');
+    const touchForceSlider = document.getElementById('touchForce');
+    const forceLabel = document.getElementById('forceLabel');
+    const modeSelect = document.getElementById('mode');
+    const sizeSlider = document.getElementById('size');
+    const sizeLabel = document.getElementById('sizeLabel');
+    const trailsCheckbox = document.getElementById('trails');
+    const adaptiveCheckbox = document.getElementById('adaptive');
+    const fpsLabel = document.getElementById('fps');
+
+    // --------- WebGL2 init ----------
+    /** @type {WebGL2RenderingContext} */
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: false });
+    if (!gl) {
+      alert('WebGL2 is required. Please use a modern browser (Chrome/Edge/Firefox/Safari).');
+      return;
+    }
+    gl.getExtension('EXT_color_buffer_float'); // may help on some platforms
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // --------- Shaders ----------
+    const vertSrc = `#version 300 es
+    precision highp float;
+    layout(location=0) in vec2 aPos;      // world coords (px)
+    layout(location=1) in vec3 aColor;    // RGB [0..1]
+    uniform vec2 uResolution;             // canvas size in px
+    uniform float uPointSize;             // in px
+    out vec3 vColor;
+    void main() {
+      // Convert from pixel space to clip space (-1..1)
+      vec2 pos = (aPos / uResolution) * 2.0 - 1.0;
+      pos.y = -pos.y; // y-up to y-down
+      gl_Position = vec4(pos, 0.0, 1.0);
+      gl_PointSize = uPointSize;
+      vColor = aColor;
+    }`;
+    const fragSrc = `#version 300 es
+    precision highp float;
+    in vec3 vColor;
+    out vec4 fragColor;
+    void main() {
+      // Soft round particle
+      vec2 p = gl_PointCoord * 2.0 - 1.0;
+      float r2 = dot(p, p);
+      float alpha = smoothstep(1.0, 0.7, r2); // soft edge
+      fragColor = vec4(vColor, alpha);
+    }`;
+
+    function compile(type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        throw new Error(gl.getShaderInfoLog(sh) || 'Shader compile error');
+      }
+      return sh;
+    }
+    function program(vs, fs) {
+      const p = gl.createProgram();
+      gl.attachShader(p, vs); gl.attachShader(p, fs);
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(p) || 'Program link error');
+      }
+      return p;
+    }
+    const prog = program(compile(gl.VERTEX_SHADER, vertSrc), compile(gl.FRAGMENT_SHADER, fragSrc));
+    gl.useProgram(prog);
+    const uResolution = gl.getUniformLocation(prog, 'uResolution');
+    const uPointSize = gl.getUniformLocation(prog, 'uPointSize');
+
+    // --------- Buffers ----------
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    // Dynamic positions
+    const posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, 8 * 100000, gl.DYNAMIC_DRAW); // reserve max (2 * 4 bytes) * 100k
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    // Static colors (we’ll refill when count changes)
+    const colBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, 12 * 100000, gl.STREAM_DRAW);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+
+    // --------- Simulation state ----------
+    let W = 0, H = 0, scale = 1;
+    function resize() {
+      scale = dpr();
+      const w = Math.floor(window.innerWidth * scale);
+      const h = Math.floor(window.innerHeight * scale);
+      if (canvas.width !== w || canvas.height !== h) {
