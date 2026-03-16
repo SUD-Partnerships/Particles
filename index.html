@@ -155,3 +155,222 @@
   function setColorStyle(packed) {
     // Convert packed to CSS only when changes (cache last)
     if (setColorStyle._last !== packed) {
+      const r = (packed >> 24) & 255;
+      const g = (packed >> 16) & 255;
+      const b = (packed >> 8) & 255;
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      setColorStyle._last = packed;
+    }
+  }
+  setColorStyle._last = 0;
+
+  function cellIndex(x, y) {
+    const cx = clamp((x / CELL) | 0, 0, gridCols - 1);
+    const cy = clamp((y / CELL) | 0, 0, gridRows - 1);
+    return cy * gridCols + cx;
+  }
+
+  function buildGrid() {
+    head.fill(-1);
+    for (let i=0; i<N; i++) {
+      const idx = cellIndex(posX[i], posY[i]);
+      next[i] = head[idx];
+      head[idx] = i;
+    }
+  }
+
+  function initParticles(count) {
+    const oldN = N;
+    N = clamp(count|0, 1, MAX_CAP);
+    for (let i = oldN; i < N; i++) {
+      posX[i] = rand(0, W);
+      posY[i] = rand(0, H);
+      const ang = Math.random() * Math.PI * 2;
+      const spd = rand(20 * dpr, 90 * dpr);
+      velX[i] = Math.cos(ang) * spd;
+      velY[i] = Math.sin(ang) * spd;
+
+      // Wide color spectrum: rainbow + jitter
+      const hue = (360 * (i / Math.max(1, N)) + rand(0, 90)) % 360;
+      color[i] = hsvToRgb(hue, 0.75, 0.95);
+    }
+    countLabel.textContent = N.toLocaleString();
+  }
+
+  // ---------- Pointer / Thumb ----------
+  function updatePointerFromEvent(ev) {
+    const rect = canvas.getBoundingClientRect();
+    if (ev.touches && ev.touches.length) {
+      const t = ev.touches[0];
+      pointer.x = (t.clientX - rect.left) * dpr;
+      pointer.y = (t.clientY - rect.top) * dpr;
+    } else {
+      pointer.x = (ev.clientX - rect.left) * dpr;
+      pointer.y = (ev.clientY - rect.top) * dpr;
+    }
+  }
+
+  canvas.addEventListener('pointerdown', (e) => { pointer.active = true; updatePointerFromEvent(e); });
+  canvas.addEventListener('pointermove', (e) => { updatePointerFromEvent(e); });
+  window.addEventListener('pointerup', () => { pointer.active = false; });
+
+  canvas.addEventListener('touchstart', (e) => { pointer.active = true; updatePointerFromEvent(e); e.preventDefault(); }, {passive:false});
+  canvas.addEventListener('touchmove',  (e) => { updatePointerFromEvent(e); e.preventDefault(); }, {passive:false});
+  window.addEventListener('touchend',   () => { pointer.active = false; });
+
+  // ---------- UI listeners ----------
+  countSlider.addEventListener('input', () => initParticles(parseInt(countSlider.value, 10)));
+  forceSlider.addEventListener('input', () => { pointer.force = parseFloat(forceSlider.value); forceLabel.textContent = pointer.force.toFixed(0); });
+  modeSelect.addEventListener('change', () => { pointer.mode = modeSelect.value; });
+  sizeSlider.addEventListener('input', () => { size = parseInt(sizeSlider.value, 10); sizeLabel.textContent = `${size} px`; });
+
+  // Init UI labels
+  countLabel.textContent = N.toLocaleString();
+  forceLabel.textContent = pointer.force.toFixed(0);
+  sizeLabel.textContent = `${size} px`;
+
+  // ---------- Main loop ----------
+  let lastT = performance.now();
+  let fpsAcc = 0, fpsCount = 0, lastFpsT = performance.now();
+
+  function step(dt) {
+    // Adaptive neighbor cap for performance
+    let neighborLimit = 24;
+    if (adaptiveCheckbox.checked) {
+      // crude heuristic: limit neighbors as N increases
+      if (N > 30000) neighborLimit = 16;
+      if (N > 60000) neighborLimit = 10;
+      if (N > 80000) neighborLimit = 6;
+    }
+
+    buildGrid();
+
+    const touchK = pointer.force;
+    const sign = (pointer.mode === 'repel') ? -1.0 : 1.0;
+
+    for (let i=0; i<N; i++) {
+      let x = posX[i], y = posY[i];
+      let vx = velX[i], vy = velY[i];
+
+      // Neighbor interactions within 3x3 cells
+      const cx = clamp((x / CELL) | 0, 0, gridCols-1);
+      const cy = clamp((y / CELL) | 0, 0, gridRows-1);
+      let considered = 0;
+
+      for (let gy = Math.max(0, cy-1); gy <= Math.min(gridRows-1, cy+1); gy++) {
+        for (let gx = Math.max(0, cx-1); gx <= Math.min(gridCols-1, cx+1); gx++) {
+          let h = head[gy * gridCols + gx];
+          while (h !== -1) {
+            if (h !== i) {
+              const dx = posX[h] - x;
+              const dy = posY[h] - y;
+              const d2 = dx*dx + dy*dy;
+              if (d2 > 0 && d2 < R2) {
+                const d = Math.sqrt(d2);
+                const nx = dx / d, ny = dy / d;
+                // Soft-core repulsion
+                const mag = K_REP * (1 - d / R);
+                vx -= nx * mag * dt;
+                vy -= ny * mag * dt;
+
+                // Viscosity (align velocities a bit)
+                vx += (velX[h] - vx) * VISC * dt;
+                vy += (velY[h] - vy) * VISC * dt;
+
+                considered++;
+                if (considered >= neighborLimit) break;
+              }
+            }
+            h = next[h];
+          }
+          if (considered >= neighborLimit) break;
+        }
+        if (considered >= neighborLimit) break;
+      }
+
+      // Thumb / mouse force (inverse-square-ish)
+      if (pointer.active && touchK > 0) {
+        const dx = pointer.x - x, dy = pointer.y - y;
+        const d2 = dx*dx + dy*dy + TOUCH_SOFT;
+        const d  = Math.sqrt(d2);
+        const nx = dx / d, ny = dy / d;
+        const f = sign * touchK / d2;
+        vx += nx * f * dt;
+        vy += ny * f * dt;
+      }
+
+      // Damping + clamp
+      vx *= DAMP; vy *= DAMP;
+      const sp2 = vx*vx + vy*vy;
+      if (sp2 > MAX_SPEED*MAX_SPEED) {
+        const s = MAX_SPEED / Math.sqrt(sp2);
+        vx *= s; vy *= s;
+      }
+
+      // Integrate
+      x += vx * dt; y += vy * dt;
+
+      // Bounce on bounds
+      if (x < 0) { x = 0; vx = Math.abs(vx); }
+      if (x > W) { x = W; vx = -Math.abs(vx); }
+      if (y < 0) { y = 0; vy = Math.abs(vy); }
+      if (y > H) { y = H; vy = -Math.abs(vy); }
+
+      posX[i] = x; posY[i] = y;
+      velX[i] = vx; velY[i] = vy;
+    }
+  }
+
+  function draw() {
+    // Trails by translucent overlay
+    if (trailsCheckbox.checked) {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 0.12; // trail strength
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1.0;
+    } else {
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // Fast squares for speed (much faster than arcs for large N)
+    const s = size * dpr;
+    for (let i=0; i<N; i++) {
+      setColorStyle(color[i]);
+      ctx.fillRect(posX[i] - (s*0.5), posY[i] - (s*0.5), s, s);
+    }
+  }
+
+  function loop() {
+    resize();
+    updateGridDims();
+
+    const now = performance.now();
+    let dt = Math.min(0.04, (now - lastT) / 1000); // clamp to 25 FPS delta max
+    lastT = now;
+
+    // Substeps when interacting for stability
+    const sub = (pointer.active ? 2 : 1);
+    const sdt = dt / sub;
+    for (let i=0; i<sub; i++) step(sdt);
+
+    draw();
+
+    // FPS (smoothed)
+    const frameNow = performance.now();
+    const realFPS = 1000 / Math.max(1, (frameNow - (loop._lastFrameTime || frameNow)));
+    loop._lastFrameTime = frameNow;
+    fpsAcc += realFPS; fpsCount++;
+    if (fpsCount >= 15) { fpsLabel.textContent = `FPS: ${ (fpsAcc/fpsCount).toFixed(0) }`; fpsAcc = 0; fpsCount = 0; }
+
+    requestAnimationFrame(loop);
+  }
+
+  // Initialize
+  initParticles(N);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
